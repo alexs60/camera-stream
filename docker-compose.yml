@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  cam-recorder:
+    build: .
+    container_name: wansview_k5_recorder
+    restart: always
+    network_mode: "host"
+    environment:
+      - RTSP_URL=rtsp://alex:qwerty@192.168.8.234:554/live/ch0
+      - CAMERA_IP=192.168.8.234
+      - MOTION_SENSITIVITY=500
+    volumes:
+      - /mnt/data/camera-stream:/recordings
