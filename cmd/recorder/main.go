@@ -20,8 +20,8 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	log.Printf("loaded %d camera(s); recordings -> %s, segments -> %s, scene_threshold=%g",
-		len(cfg.Cameras), cfg.RecordingPath, cfg.TmpfsPath, cfg.SceneThreshold)
+	log.Printf("loaded %d camera(s); recordings -> %s, segments -> %s, motion_threshold=%g",
+		len(cfg.Cameras), cfg.RecordingPath, cfg.TmpfsPath, cfg.MotionThreshold)
 	log.Printf("clip params: pre_roll=%s post_roll=%s max_clip=%s segment=%s",
 		cfg.PreRoll, cfg.PostRoll, cfg.MaxClipDuration, cfg.SegmentDuration)
 

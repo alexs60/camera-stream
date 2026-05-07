@@ -109,7 +109,6 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		RTSPURL:        s.Cam.RTSP,
 		SegmentDir:     s.segDir,
 		SegmentSeconds: s.Cfg.SegmentDuration,
-		SceneThreshold: s.Cfg.SceneThreshold,
 	})
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
@@ -124,11 +123,11 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
-	events := make(chan MotionEvent, 64)
+	scores := make(chan MotionScore, 256)
 	parseDone := make(chan error, 1)
 	go func() {
-		parseDone <- ParseStderr(stderr, s.Cam.Name, events, s.Logger)
-		close(events)
+		parseDone <- ParseStderr(stderr, s.Cam.Name, scores, s.Logger)
+		close(scores)
 	}()
 
 	tick := time.NewTicker(500 * time.Millisecond)
@@ -137,6 +136,8 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	defer pruneTick.Stop()
 	stallTick := time.NewTicker(5 * time.Second)
 	defer stallTick.Stop()
+	heartbeatTick := time.NewTicker(60 * time.Second)
+	defer heartbeatTick.Stop()
 
 	// Stall watchdog: if ffmpeg connects but stops emitting segments
 	// (silent network drop, decoder lockup, …) ffmpeg itself won't
@@ -147,6 +148,13 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	startedAt := time.Now()
 	lastSegMTime := time.Time{}
 
+	// Per-period stats for the motion heartbeat.
+	var (
+		periodMaxScore float64
+		periodFrames   int
+		periodTriggers int
+	)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,7 +162,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 			_ = cmd.Wait()
 			return ctx.Err()
 
-		case ev, ok := <-events:
+		case score, ok := <-scores:
 			if !ok {
 				// stderr closed -> ffmpeg is done; reap and report
 				err := cmd.Wait()
@@ -166,13 +174,27 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 				}
 				return err
 			}
-			s.handleMotion(ev.Wall)
+			periodFrames++
+			if score.YAVG > periodMaxScore {
+				periodMaxScore = score.YAVG
+			}
+			if score.YAVG >= s.Cfg.MotionThreshold {
+				periodTriggers++
+				s.handleMotion(score.Wall)
+			}
 
 		case now := <-tick.C:
 			s.handleTick(now)
 
 		case <-pruneTick.C:
 			s.prune()
+
+		case <-heartbeatTick.C:
+			s.Logger.Printf("motion stats: max_yavg=%.2f over %d frames, %d triggers (threshold=%.2f)",
+				periodMaxScore, periodFrames, periodTriggers, s.Cfg.MotionThreshold)
+			periodMaxScore = 0
+			periodFrames = 0
+			periodTriggers = 0
 
 		case now := <-stallTick.C:
 			segs, err := ListSegments(s.segDir)

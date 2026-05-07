@@ -6,7 +6,7 @@ func TestLoad_TwoCameras(t *testing.T) {
 	env := []string{
 		"RECORDING_PATH=/rec",
 		"TMPFS_PATH=/tmp/seg",
-		"SCENE_THRESHOLD=0.07",
+		"MOTION_THRESHOLD=6.5",
 		"CAMERA_1_NAME=front",
 		"CAMERA_1_RTSP=rtsp://u:p@1.1.1.1/x",
 		"CAMERA_1_IP=1.1.1.1",
@@ -21,8 +21,8 @@ func TestLoad_TwoCameras(t *testing.T) {
 	if cfg.RecordingPath != "/rec" || cfg.TmpfsPath != "/tmp/seg" {
 		t.Errorf("paths: %+v", cfg)
 	}
-	if cfg.SceneThreshold != 0.07 {
-		t.Errorf("threshold: %v", cfg.SceneThreshold)
+	if cfg.MotionThreshold != 6.5 {
+		t.Errorf("threshold: %v", cfg.MotionThreshold)
 	}
 	if len(cfg.Cameras) != 2 || cfg.Cameras[0].Name != "front" || cfg.Cameras[1].Name != "back" {
 		t.Errorf("cameras: %+v", cfg.Cameras)

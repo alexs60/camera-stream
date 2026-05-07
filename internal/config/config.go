@@ -15,9 +15,13 @@ type Camera struct {
 }
 
 type Config struct {
-	RecordingPath   string
-	TmpfsPath       string
-	SceneThreshold  float64
+	RecordingPath string
+	TmpfsPath     string
+	// MotionThreshold is the average per-pixel luma difference (0-255 scale)
+	// between consecutive sampled frames above which we declare motion.
+	// Static surveillance scenes hover around 0.5-2 (sensor noise); a person
+	// walking through frame produces 5-30+. Default 4.0.
+	MotionThreshold float64
 	PreRoll         time.Duration
 	PostRoll        time.Duration
 	MaxClipDuration time.Duration
@@ -40,14 +44,14 @@ func Load(env []string) (*Config, error) {
 		SegmentDuration: 2 * time.Second,
 	}
 
-	thr, err := parseFloat(getOr(m, "SCENE_THRESHOLD", "0.05"))
+	thr, err := parseFloat(getOr(m, "MOTION_THRESHOLD", "4.0"))
 	if err != nil {
-		return nil, fmt.Errorf("SCENE_THRESHOLD: %w", err)
+		return nil, fmt.Errorf("MOTION_THRESHOLD: %w", err)
 	}
-	if thr <= 0 || thr >= 1 {
-		return nil, fmt.Errorf("SCENE_THRESHOLD must be in (0,1), got %v", thr)
+	if thr <= 0 || thr > 255 {
+		return nil, fmt.Errorf("MOTION_THRESHOLD must be in (0,255], got %v", thr)
 	}
-	cfg.SceneThreshold = thr
+	cfg.MotionThreshold = thr
 
 	cams, err := parseCameras(m)
 	if err != nil {

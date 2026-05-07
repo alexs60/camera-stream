@@ -11,7 +11,6 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 		RTSPURL:        "rtsp://u:p@1.2.3.4/x",
 		SegmentDir:     "/tmp/seg/front",
 		SegmentSeconds: 2 * time.Second,
-		SceneThreshold: 0.05,
 	})
 
 	joined := strings.Join(args, " ")
@@ -22,7 +21,7 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 		"-c copy",
 		"-f segment",
 		"/tmp/seg/front/seg_%05d.ts",
-		"select='gt(scene,0.05)',showinfo",
+		"fps=2,scale=160:-2,format=gray,tblend=all_mode=difference,signalstats,metadata=mode=print:file=/dev/stderr",
 		"-f null",
 	} {
 		if !strings.Contains(joined, want) {
@@ -30,7 +29,7 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 		}
 	}
 
-	for _, dontWant := range []string{"-stimeout", "-reconnect ", "-rw_timeout"} {
+	for _, dontWant := range []string{"-stimeout", "-reconnect ", "-rw_timeout", "select='gt(scene"} {
 		if strings.Contains(joined, dontWant) {
 			t.Errorf("argv should not contain %q (was removed): %s", dontWant, joined)
 		}
@@ -43,9 +42,8 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 
 func TestFFmpegArgs_Defaults(t *testing.T) {
 	args := FFmpegArgs(FFmpegArgsParams{
-		RTSPURL:        "rtsp://x",
-		SegmentDir:     "/d",
-		SceneThreshold: 0.05,
+		RTSPURL:    "rtsp://x",
+		SegmentDir: "/d",
 	})
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "-segment_time 2.000") {

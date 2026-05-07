@@ -15,11 +15,17 @@ import (
 //     codec, bitrate, and fps. We rely on the supervisor goroutine to prune
 //     old segments so disk usage stays bounded.
 //
-//  2. Scene-change null sink: select=gt(scene,sceneThreshold),showinfo. We
-//     don't write the output anywhere (-f null), we just want ffmpeg to log
-//     a "[Parsed_showinfo_…] pts_time:NNN" line on stderr each time the
-//     scene-change score crosses the threshold. The Go supervisor parses
-//     those lines and treats them as motion events.
+//  2. Motion-detection null sink: decode at 2 fps, downscale to 160px wide,
+//     convert to grayscale, frame-difference vs the previous frame, then
+//     signalstats writes the average difference (YAVG) as metadata. The
+//     metadata filter prints it to stderr, where the Go supervisor reads
+//     and thresholds it.
+//
+//     Why frame-difference instead of select=gt(scene,X): scene detects
+//     *transitions* (fires once when motion starts, then nothing while it
+//     continues). Frame-difference produces a score on every sampled frame
+//     while motion is happening, which is what we want for post-roll
+//     extension.
 //
 // We deliberately keep this a pure function returning a []string so it can
 // be unit-tested without spawning ffmpeg.
@@ -27,7 +33,6 @@ type FFmpegArgsParams struct {
 	RTSPURL        string
 	SegmentDir     string
 	SegmentSeconds time.Duration
-	SceneThreshold float64
 }
 
 func FFmpegArgs(p FFmpegArgsParams) []string {
@@ -63,9 +68,12 @@ func FFmpegArgs(p FFmpegArgsParams) []string {
 		"-strftime", "0",
 		segPattern,
 
-		// Output 2: scene-change detector → null sink, lines on stderr
+		// Output 2: motion detector → null sink. metadata=print writes
+		// "lavfi.signalstats.YAVG=N.NNNNNN" lines to /dev/stderr; the Go
+		// supervisor parses those and applies the threshold.
 		"-map", "0:v:0",
-		"-vf", fmt.Sprintf("select='gt(scene,%g)',showinfo", p.SceneThreshold),
+		"-vf", "fps=2,scale=160:-2,format=gray,tblend=all_mode=difference," +
+			"signalstats,metadata=mode=print:file=/dev/stderr",
 		"-an",
 		"-f", "null",
 		"-",
