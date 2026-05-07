@@ -126,18 +126,31 @@ def write_frame(proc, frame):
         pass
 
 
-def safe_makedirs(path, retries=3, delay=0.5):
-    # NFS handles go stale (ESTALE = errno 116) if the export is remounted
-    # while we hold a cached handle. The next operation usually refreshes
-    # the client cache, so retry briefly instead of crashing.
-    for attempt in range(retries):
+def safe_makedirs(path, max_seconds=30.0):
+    # NFS handles go stale (ESTALE = errno 116) when the cached inode for
+    # `path` no longer matches the server (server reboot, share remount,
+    # parent readdir not refreshed yet). Empirically the cache clears within
+    # ~25s; retrying with a forced parent readdir between attempts usually
+    # recovers without needing a docker restart.
+    parent = os.path.dirname(path) or "/"
+    deadline = time.time() + max_seconds
+    delay = 0.5
+    while True:
         try:
             os.makedirs(path, exist_ok=True)
             return
         except OSError as e:
-            if e.errno != errno.ESTALE or attempt == retries - 1:
+            if e.errno != errno.ESTALE or time.time() >= deadline:
                 raise
+            print(f"ESTALE on {path}; refreshing parent and retrying in {delay:.1f}s")
+            try:
+                with os.scandir(parent) as it:
+                    for _ in it:
+                        pass
+            except OSError:
+                pass
             time.sleep(delay)
+            delay = min(delay * 1.5, 5.0)
 
 
 def open_clip(buffer, w, h):
