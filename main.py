@@ -27,9 +27,19 @@ FRAME_INTERVAL = 1.0 / TARGET_FPS
 # If the grabber's frame timestamp doesn't advance for this long the stream
 # is considered stalled (TCP alive but no frames arriving) and we reconnect.
 STALL_TIMEOUT = 10.0
+# If the FRAME CONTENT doesn't change for this long the stream is delivering
+# the same frame repeatedly (decoder stuck, source paused, etc.) — sensor
+# and compression noise alone make this implausible for any live stream.
+FROZEN_TIMEOUT = 30.0
 # Periodic heartbeat so `docker logs` shows the loop is alive even when no
 # motion is firing.
 STATUS_INTERVAL = 30.0
+
+
+def frame_fingerprint(frame):
+    # Cheap content fingerprint — 8x8 thumbnail's bytes. Identical bytes
+    # across reads means the decoder is handing us the same frame.
+    return cv2.resize(frame, (8, 8), interpolation=cv2.INTER_AREA).tobytes()
 
 
 class FrameGrabber:
@@ -188,9 +198,13 @@ def main():
     last_status_at = time.time()
     frames_since_status = 0
     motion_pixels_max = 0
+    last_fingerprint = None
+    last_fresh_frame_at = time.time()
+    fingerprint_changes = 0
 
     def reconnect(reason):
         nonlocal cap, grabber, out, last_tick, last_grabber_ts, last_grabber_ts_change_at
+        nonlocal last_fingerprint, last_fresh_frame_at
         print(f"Reconnecting: {reason}")
         if out is not None:
             close_writer(out)
@@ -204,6 +218,8 @@ def main():
         last_tick = 0.0
         last_grabber_ts = 0.0
         last_grabber_ts_change_at = time.time()
+        last_fingerprint = None
+        last_fresh_frame_at = time.time()
 
     while True:
         if not grabber.alive():
@@ -232,16 +248,27 @@ def main():
         if frame is None:
             continue
 
+        fp = frame_fingerprint(frame)
+        if fp != last_fingerprint:
+            last_fingerprint = fp
+            last_fresh_frame_at = now
+            fingerprint_changes += 1
+        elif now - last_fresh_frame_at > FROZEN_TIMEOUT:
+            reconnect(f"frame content frozen for {FROZEN_TIMEOUT:.0f}s")
+            continue
+
         if now - last_status_at >= STATUS_INTERVAL:
             elapsed = now - last_status_at
             rate = frames_since_status / elapsed if elapsed > 0 else 0.0
             print(
                 f"[heartbeat] {rate:.1f} fps, recording={out is not None}, "
-                f"buffer={len(buffer)}, last_motion_max_pixels={motion_pixels_max}"
+                f"buffer={len(buffer)}, motion_max={motion_pixels_max}, "
+                f"frame_changes={fingerprint_changes}"
             )
             last_status_at = now
             frames_since_status = 0
             motion_pixels_max = 0
+            fingerprint_changes = 0
         frames_since_status += 1
 
         cutoff = now - PRE_ROLL_SECONDS
