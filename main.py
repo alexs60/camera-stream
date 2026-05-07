@@ -126,12 +126,12 @@ def write_frame(proc, frame):
         pass
 
 
-def safe_makedirs(path, max_seconds=30.0):
-    # NFS handles go stale (ESTALE = errno 116) when the cached inode for
-    # `path` no longer matches the server (server reboot, share remount,
-    # parent readdir not refreshed yet). Empirically the cache clears within
-    # ~25s; retrying with a forced parent readdir between attempts usually
-    # recovers without needing a docker restart.
+def safe_makedirs(path, max_seconds=5.0):
+    # NFS handles go stale (ESTALE = errno 116) when the cached inode no
+    # longer matches the server. A short retry rides out sub-second blips,
+    # but persistent staleness only clears when the share is remounted —
+    # which is exactly what happens when docker restarts the container, so
+    # we fail fast and let the restart policy handle it.
     parent = os.path.dirname(path) or "/"
     deadline = time.time() + max_seconds
     delay = 0.5
@@ -150,7 +150,7 @@ def safe_makedirs(path, max_seconds=30.0):
             except OSError:
                 pass
             time.sleep(delay)
-            delay = min(delay * 1.5, 5.0)
+            delay = min(delay * 1.5, 2.0)
 
 
 def open_clip(buffer, w, h):
