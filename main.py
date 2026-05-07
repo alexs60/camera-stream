@@ -2,6 +2,7 @@ import cv2
 import time
 import os
 import datetime
+import subprocess
 from collections import deque
 
 # --- CONFIG ---
@@ -35,6 +36,49 @@ def measure_fps(cap, sample_seconds=FPS_SAMPLE_SECONDS):
     elapsed = time.time() - start
     return max(count / elapsed, 1.0) if elapsed > 0 else 1.0
 
+def open_writer(filename, fps, w, h):
+    # Pipe raw BGR frames to ffmpeg so the resulting MP4 is H.264/yuv420p
+    # with +faststart — playable in Chrome/Safari/Firefox without re-mux.
+    # opencv-python-headless ships without an H.264 encoder, hence ffmpeg.
+    return subprocess.Popen(
+        [
+            "ffmpeg",
+            "-loglevel", "error",
+            "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}",
+            "-r", f"{fps:.4f}",
+            "-i", "-",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "ultrafast",
+            "-movflags", "+faststart",
+            filename,
+        ],
+        stdin=subprocess.PIPE,
+    )
+
+def close_writer(proc):
+    if proc is None:
+        return
+    try:
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+def write_frame(proc, frame):
+    try:
+        proc.stdin.write(frame.tobytes())
+    except BrokenPipeError:
+        pass
+
 def main():
     if not os.access(RECORDING_PATH, os.W_OK):
         print(f"ERROR: {RECORDING_PATH} is not writable. Check NFS mount.")
@@ -49,14 +93,13 @@ def main():
 
     out = None
     recording_until = 0.0
-    last_written_ts = 0.0  # timestamp of last frame written to any file
 
     while True:
         ret, frame = cap.read()
         now = time.time()
         if not ret:
             if out is not None:
-                out.release()
+                close_writer(out)
                 out = None
                 print("Recording saved (stream dropped).")
             cap.release()
@@ -66,7 +109,7 @@ def main():
             buffer.clear()
             continue
 
-        buffer.append((now, frame))
+        # Trim buffer first; current frame goes in at the end of the loop.
         cutoff = now - PRE_ROLL_SECONDS
         while buffer and buffer[0][0] < cutoff:
             buffer.popleft()
@@ -81,28 +124,28 @@ def main():
             os.makedirs(day_dir, exist_ok=True)
             filename = f"{day_dir}/{ts}-{CAMERA_IP}.mp4"
             print(f"Motion detected! Recording to {filename}")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             h, w, _ = frame.shape
-            out = cv2.VideoWriter(filename, fourcc, fps, (w, h))
-            # Only write pre-roll frames newer than the last frame we wrote
-            # to a previous file — avoids overlap when motion is continuous
-            # across back-to-back clips.
-            for ts_f, f in buffer:
-                if ts_f > last_written_ts:
-                    out.write(f)
-                    last_written_ts = ts_f
-            # Fixed 30s clip = pre-roll already written + POST_ROLL_SECONDS more.
-            # If motion continues past this deadline, the next iteration will
-            # see out=None and open a new file (skipping the now-redundant pre-roll).
+            out = open_writer(filename, fps, w, h)
+            # Pre-roll: write up to PRE_ROLL_SECONDS of buffered frames.
+            # If a previous clip ended recently those frames overlap with
+            # its tail — that's intentional; every clip gets its own pre-roll.
+            for _, f in buffer:
+                write_frame(out, f)
+
+        # Every motion frame pushes the deadline forward, so a sustained
+        # event produces ONE file ending POST_ROLL_SECONDS after the last
+        # motion frame — not a series of 30s chunks.
+        if motion and out is not None:
             recording_until = now + POST_ROLL_SECONDS
 
         if out is not None:
-            out.write(frame)
-            last_written_ts = now
+            write_frame(out, frame)
             if now >= recording_until:
-                out.release()
+                close_writer(out)
                 out = None
                 print("Recording saved.")
+
+        buffer.append((now, frame))
 
 if __name__ == "__main__":
     main()
