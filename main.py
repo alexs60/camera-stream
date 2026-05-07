@@ -3,6 +3,7 @@ import time
 import os
 import datetime
 import subprocess
+import threading
 from collections import deque
 
 # --- CONFIG ---
@@ -16,7 +17,52 @@ POST_ROLL_SECONDS = 20
 # If motion sustains past this, the writer rotates and the next clip's
 # pre-roll overlaps the previous clip's tail by PRE_ROLL_SECONDS.
 MAX_CLIP_SECONDS = 40
-FPS_SAMPLE_SECONDS = 5
+# Process and encode at this fixed rate, regardless of the camera's native
+# FPS. Writer fps == this rate, so playback duration always tracks wall-clock
+# duration. Lower this if libx264 can't keep up (files would otherwise play
+# in slow motion). Two containers on a modest CPU should each run 10-15 fps.
+TARGET_FPS = float(os.getenv("TARGET_FPS", "15"))
+FRAME_INTERVAL = 1.0 / TARGET_FPS
+
+
+class FrameGrabber:
+    # OpenCV/FFmpeg's RTSP backend queues unread frames; when the consumer
+    # falls behind (CPU contention from a second container, encoder load),
+    # cap.read() returns increasingly stale frames and the recording lags
+    # real time. This thread drains the queue continuously and exposes only
+    # the most recent frame; the main loop reads it at TARGET_FPS and the
+    # in-between camera frames are dropped.
+    def __init__(self, cap):
+        self.cap = cap
+        self._frame = None
+        self._ts = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._alive = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                self._alive = False
+                return
+            with self._lock:
+                self._frame = frame
+                self._ts = time.time()
+
+    def read(self):
+        with self._lock:
+            return self._frame, self._ts
+
+    def alive(self):
+        return self._alive
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+
 
 def get_cap():
     while True:
@@ -26,21 +72,8 @@ def get_cap():
             return cap
         time.sleep(10)
 
-def measure_fps(cap, sample_seconds=FPS_SAMPLE_SECONDS):
-    # The camera's reported FPS is unreliable over RTSP — measure the rate
-    # we actually pull frames at, since that's what the writer must match
-    # for playback duration to equal capture duration.
-    start = time.time()
-    count = 0
-    while time.time() - start < sample_seconds:
-        ret, _ = cap.read()
-        if not ret:
-            break
-        count += 1
-    elapsed = time.time() - start
-    return max(count / elapsed, 1.0) if elapsed > 0 else 1.0
 
-def open_writer(filename, fps, w, h):
+def open_writer(filename, w, h):
     # Pipe raw BGR frames to ffmpeg so the resulting MP4 is H.264/yuv420p
     # with +faststart — playable in Chrome/Safari/Firefox without re-mux.
     # opencv-python-headless ships without an H.264 encoder, hence ffmpeg.
@@ -53,7 +86,7 @@ def open_writer(filename, fps, w, h):
             "-vcodec", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", f"{w}x{h}",
-            "-r", f"{fps:.4f}",
+            "-r", f"{TARGET_FPS:.4f}",
             "-i", "-",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
@@ -63,6 +96,7 @@ def open_writer(filename, fps, w, h):
         ],
         stdin=subprocess.PIPE,
     )
+
 
 def close_writer(proc):
     if proc is None:
@@ -77,20 +111,36 @@ def close_writer(proc):
         proc.kill()
         proc.wait()
 
+
 def write_frame(proc, frame):
     try:
         proc.stdin.write(frame.tobytes())
     except BrokenPipeError:
         pass
 
+
+def open_clip(buffer, w, h):
+    day = datetime.datetime.now().strftime("%Y-%m-%d")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    day_dir = f"{RECORDING_PATH}/{day}"
+    os.makedirs(day_dir, exist_ok=True)
+    filename = f"{day_dir}/{ts}-{CAMERA_IP}.mp4"
+    print(f"Recording to {filename}")
+    out = open_writer(filename, w, h)
+    for _, f in buffer:
+        write_frame(out, f)
+    return out
+
+
 def main():
     if not os.access(RECORDING_PATH, os.W_OK):
         print(f"ERROR: {RECORDING_PATH} is not writable. Check NFS mount.")
         return
 
+    print(f"Target processing/encoding rate: {TARGET_FPS:.1f} FPS")
+
     cap = get_cap()
-    fps = measure_fps(cap)
-    print(f"Measured capture rate: {fps:.2f} FPS")
+    grabber = FrameGrabber(cap)
 
     buffer = deque()  # (timestamp, frame), trimmed to last PRE_ROLL_SECONDS
     back_sub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=True)
@@ -98,23 +148,36 @@ def main():
     out = None
     clip_opened_at = 0.0
     recording_until = 0.0
+    last_tick = 0.0
 
     while True:
-        ret, frame = cap.read()
-        now = time.time()
-        if not ret:
+        if not grabber.alive():
             if out is not None:
                 close_writer(out)
                 out = None
                 print("Recording saved (stream dropped).")
+            grabber.stop()
             cap.release()
             cap = get_cap()
-            fps = measure_fps(cap)
-            print(f"Re-measured capture rate: {fps:.2f} FPS")
+            grabber = FrameGrabber(cap)
             buffer.clear()
+            last_tick = 0.0
             continue
 
-        # Trim buffer first; current frame goes in at the end of the loop.
+        # Pace the loop at TARGET_FPS. If processing took longer than the
+        # interval, sleep_for is negative and we run flat-out (slow-motion
+        # files in that case, but never wrong-speed).
+        now = time.time()
+        sleep_for = (last_tick + FRAME_INTERVAL) - now
+        if sleep_for > 0.001:
+            time.sleep(sleep_for)
+        last_tick = time.time()
+        now = last_tick
+
+        frame, _ = grabber.read()
+        if frame is None:
+            continue
+
         cutoff = now - PRE_ROLL_SECONDS
         while buffer and buffer[0][0] < cutoff:
             buffer.popleft()
@@ -123,31 +186,14 @@ def main():
         motion = cv2.countNonZero(mask) > MOTION_THRESHOLD
 
         if motion and out is None:
-            day = datetime.datetime.now().strftime("%Y-%m-%d")
-            ts = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-            day_dir = f"{RECORDING_PATH}/{day}"
-            os.makedirs(day_dir, exist_ok=True)
-            filename = f"{day_dir}/{ts}-{CAMERA_IP}.mp4"
-            print(f"Motion detected! Recording to {filename}")
+            print("Motion detected!")
             h, w, _ = frame.shape
-            out = open_writer(filename, fps, w, h)
+            out = open_clip(buffer, w, h)
             clip_opened_at = now
-            # Pre-roll: write up to PRE_ROLL_SECONDS of buffered frames.
-            # If a previous clip ended recently those frames overlap with
-            # its tail — that's intentional; every clip gets its own pre-roll.
-            for _, f in buffer:
-                write_frame(out, f)
 
-        # Every motion frame pushes the deadline forward, so a sustained
-        # event keeps the writer open until POST_ROLL_SECONDS after the
-        # last motion frame.
         if motion and out is not None:
             recording_until = now + POST_ROLL_SECONDS
 
-        # Rotate if the clip would exceed MAX_CLIP_SECONDS but motion is
-        # still active. The new clip's pre-roll buffer is the last
-        # PRE_ROLL_SECONDS of frames — i.e. the tail of the closing clip,
-        # giving the requested overlap.
         if (
             out is not None
             and now - clip_opened_at >= MAX_CLIP_SECONDS - PRE_ROLL_SECONDS
@@ -155,17 +201,9 @@ def main():
         ):
             close_writer(out)
             print("Clip rotated (motion still active).")
-            day = datetime.datetime.now().strftime("%Y-%m-%d")
-            ts = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-            day_dir = f"{RECORDING_PATH}/{day}"
-            os.makedirs(day_dir, exist_ok=True)
-            filename = f"{day_dir}/{ts}-{CAMERA_IP}.mp4"
-            print(f"Continuing to {filename}")
             h, w, _ = frame.shape
-            out = open_writer(filename, fps, w, h)
+            out = open_clip(buffer, w, h)
             clip_opened_at = now
-            for _, f in buffer:
-                write_frame(out, f)
 
         if out is not None:
             write_frame(out, frame)
@@ -175,6 +213,7 @@ def main():
                 print("Recording saved.")
 
         buffer.append((now, frame))
+
 
 if __name__ == "__main__":
     main()
