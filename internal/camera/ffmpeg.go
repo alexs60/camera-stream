@@ -24,23 +24,19 @@ import (
 // We deliberately keep this a pure function returning a []string so it can
 // be unit-tested without spawning ffmpeg.
 type FFmpegArgsParams struct {
-	RTSPURL         string
-	SegmentDir      string
-	SegmentSeconds  time.Duration
-	SceneThreshold  float64
-	ReconnectDelay  time.Duration
-	StimeoutSeconds int // RTSP socket I/O timeout
+	RTSPURL        string
+	SegmentDir     string
+	SegmentSeconds time.Duration
+	SceneThreshold float64
+	IOTimeoutSecs  int // RTSP socket I/O timeout (read/write), seconds
 }
 
 func FFmpegArgs(p FFmpegArgsParams) []string {
 	if p.SegmentSeconds <= 0 {
 		p.SegmentSeconds = 2 * time.Second
 	}
-	if p.ReconnectDelay <= 0 {
-		p.ReconnectDelay = 30 * time.Second
-	}
-	if p.StimeoutSeconds <= 0 {
-		p.StimeoutSeconds = 5 // ffmpeg's stimeout is in microseconds; we accept seconds for ergonomics
+	if p.IOTimeoutSecs <= 0 {
+		p.IOTimeoutSecs = 5
 	}
 
 	segPattern := filepath.Join(p.SegmentDir, "seg_%05d.ts")
@@ -51,12 +47,12 @@ func FFmpegArgs(p FFmpegArgsParams) []string {
 		"-loglevel", "info", // info is needed for showinfo lines
 		"-nostdin",
 
-		// RTSP input
+		// RTSP input. -rw_timeout is the modern cross-version socket I/O
+		// timeout (microseconds); it replaces the removed -stimeout.
+		// Reconnect on failure is handled by the Go supervisor restarting
+		// ffmpeg, since the -reconnect* family is HTTP-protocol-only.
 		"-rtsp_transport", "tcp",
-		"-stimeout", fmt.Sprintf("%d", p.StimeoutSeconds*1_000_000), // microseconds
-		"-reconnect", "1",
-		"-reconnect_streamed", "1",
-		"-reconnect_delay_max", fmt.Sprintf("%d", int(p.ReconnectDelay.Seconds())),
+		"-rw_timeout", fmt.Sprintf("%d", p.IOTimeoutSecs*1_000_000),
 		"-i", p.RTSPURL,
 
 		// Output 1: segment ring buffer (codec copy)

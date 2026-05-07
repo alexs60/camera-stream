@@ -18,6 +18,7 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 
 	for _, want := range []string{
 		"-rtsp_transport tcp",
+		"-rw_timeout 5000000",
 		"-i rtsp://u:p@1.2.3.4/x",
 		"-c copy",
 		"-f segment",
@@ -30,7 +31,12 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 		}
 	}
 
-	// First token must be the ffmpeg executable name.
+	for _, dontWant := range []string{"-stimeout", "-reconnect "} {
+		if strings.Contains(joined, dontWant) {
+			t.Errorf("argv should not contain %q (was removed): %s", dontWant, joined)
+		}
+	}
+
 	if args[0] != "ffmpeg" {
 		t.Errorf("argv[0] = %q, want ffmpeg", args[0])
 	}
@@ -43,7 +49,6 @@ func TestFFmpegArgs_Defaults(t *testing.T) {
 		SceneThreshold: 0.05,
 	})
 	joined := strings.Join(args, " ")
-	// SegmentSeconds defaults to 2s -> segment_time 2.000
 	if !strings.Contains(joined, "-segment_time 2.000") {
 		t.Errorf("expected default segment_time 2.000 in argv: %s", joined)
 	}
