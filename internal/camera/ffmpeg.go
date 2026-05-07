@@ -28,15 +28,11 @@ type FFmpegArgsParams struct {
 	SegmentDir     string
 	SegmentSeconds time.Duration
 	SceneThreshold float64
-	IOTimeoutSecs  int // RTSP socket I/O timeout (read/write), seconds
 }
 
 func FFmpegArgs(p FFmpegArgsParams) []string {
 	if p.SegmentSeconds <= 0 {
 		p.SegmentSeconds = 2 * time.Second
-	}
-	if p.IOTimeoutSecs <= 0 {
-		p.IOTimeoutSecs = 5
 	}
 
 	segPattern := filepath.Join(p.SegmentDir, "seg_%05d.ts")
@@ -47,12 +43,14 @@ func FFmpegArgs(p FFmpegArgsParams) []string {
 		"-loglevel", "info", // info is needed for showinfo lines
 		"-nostdin",
 
-		// RTSP input. -rw_timeout is the modern cross-version socket I/O
-		// timeout (microseconds); it replaces the removed -stimeout.
-		// Reconnect on failure is handled by the Go supervisor restarting
-		// ffmpeg, since the -reconnect* family is HTTP-protocol-only.
+		// RTSP input. We don't pass any I/O-timeout flag here: -stimeout
+		// was removed in newer ffmpeg, -rw_timeout is rejected by the
+		// rtsp demuxer ("Option rw_timeout not found"), and -timeout has
+		// ambiguous semantics across formats. Connection refusal is
+		// detected at the TCP layer in ~hundreds of ms; silent hangs
+		// (broken connection that never RSTs) are caught by the
+		// supervisor's stall watchdog.
 		"-rtsp_transport", "tcp",
-		"-rw_timeout", fmt.Sprintf("%d", p.IOTimeoutSecs*1_000_000),
 		"-i", p.RTSPURL,
 
 		// Output 1: segment ring buffer (codec copy)

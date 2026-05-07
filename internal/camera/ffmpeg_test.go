@@ -18,7 +18,6 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 
 	for _, want := range []string{
 		"-rtsp_transport tcp",
-		"-rw_timeout 5000000",
 		"-i rtsp://u:p@1.2.3.4/x",
 		"-c copy",
 		"-f segment",
@@ -31,7 +30,7 @@ func TestFFmpegArgs_Shape(t *testing.T) {
 		}
 	}
 
-	for _, dontWant := range []string{"-stimeout", "-reconnect "} {
+	for _, dontWant := range []string{"-stimeout", "-reconnect ", "-rw_timeout"} {
 		if strings.Contains(joined, dontWant) {
 			t.Errorf("argv should not contain %q (was removed): %s", dontWant, joined)
 		}

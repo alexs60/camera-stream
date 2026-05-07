@@ -135,6 +135,17 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	defer tick.Stop()
 	pruneTick := time.NewTicker(10 * time.Second)
 	defer pruneTick.Stop()
+	stallTick := time.NewTicker(5 * time.Second)
+	defer stallTick.Stop()
+
+	// Stall watchdog: if ffmpeg connects but stops emitting segments
+	// (silent network drop, decoder lockup, …) ffmpeg itself won't
+	// notice for up to 2 hours under default TCP keepalive. Kill it
+	// after stallTimeout of no new segments and let the supervisor
+	// respawn.
+	const stallTimeout = 30 * time.Second
+	startedAt := time.Now()
+	lastSegMTime := time.Time{}
 
 	for {
 		select {
@@ -162,6 +173,29 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 
 		case <-pruneTick.C:
 			s.prune()
+
+		case now := <-stallTick.C:
+			segs, err := ListSegments(s.segDir)
+			if err != nil || len(segs) == 0 {
+				// No segments yet. Tolerate this for a while after spawn
+				// (RTSP handshake can take a few seconds), but if we never
+				// see one, kill ffmpeg so the supervisor retries.
+				if now.Sub(startedAt) > stallTimeout {
+					s.Logger.Printf("stall: no segments produced in %s, killing ffmpeg", stallTimeout)
+					_ = cmd.Process.Kill()
+				}
+				continue
+			}
+			latest := segs[len(segs)-1].MTime
+			if !latest.Equal(lastSegMTime) {
+				lastSegMTime = latest
+				continue
+			}
+			if now.Sub(latest) > stallTimeout {
+				s.Logger.Printf("stall: no new segment for %s (last at %s), killing ffmpeg",
+					now.Sub(latest).Truncate(time.Second), latest.Format(time.RFC3339))
+				_ = cmd.Process.Kill()
+			}
 		}
 	}
 }
