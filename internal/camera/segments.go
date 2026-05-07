@@ -47,16 +47,19 @@ func ListSegments(dir string) ([]Segment, error) {
 // SegmentsCovering returns the segments needed to satisfy the [start, end]
 // wall-clock range. It includes the segment whose mtime is the latest one
 // at-or-before start (because that segment's *content* spans up to its
-// close-time), and every segment with mtime <= end. The caller is
-// responsible for waiting until "end" has actually passed before invoking.
-func SegmentsCovering(segs []Segment, start, end time.Time) []Segment {
+// close-time), and every segment with mtime <= end.
+//
+// includeBufferAhead controls whether to also include the segment with
+// the smallest mtime > end. Pass true for normal clip close (the next
+// segment's content begins shortly after our end timestamp and contains
+// the last frames of the post-roll). Pass false for salvage clips where
+// ffmpeg has died — the next segment may have been mid-write at the
+// moment of death and is likely truncated/corrupt.
+func SegmentsCovering(segs []Segment, start, end time.Time, includeBufferAhead bool) []Segment {
 	if len(segs) == 0 {
 		return nil
 	}
 	first := 0
-	// Walk forward to the last segment whose mtime is <= start; that's the
-	// one whose recorded content begins before start. If no such segment
-	// exists (start predates all segments), use the first.
 	for i, s := range segs {
 		if s.MTime.After(start) {
 			break
@@ -70,11 +73,7 @@ func SegmentsCovering(segs []Segment, start, end time.Time) []Segment {
 		}
 		last = i
 	}
-	// Include one extra segment past `last` because its content overlaps
-	// the tail of the requested range — its mtime is when it closed, but
-	// the segment after it is what carries the post-end frames already
-	// flushed. If there is no such segment yet, the caller should retry.
-	if last+1 < len(segs) {
+	if includeBufferAhead && last+1 < len(segs) {
 		last++
 	}
 	return segs[first : last+1]

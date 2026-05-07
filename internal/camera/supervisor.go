@@ -96,7 +96,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 			if now := time.Now(); now.Before(s.cur.endsAt) {
 				s.cur.endsAt = now
 			}
-			s.spawnFinalize(s.cur)
+			s.spawnFinalize(s.cur, true) // salvage: skip the buffer-ahead segment
 			s.cur = nil
 		}
 		// Wait for any in-flight finalize to drain its segments before we
@@ -147,6 +147,13 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	const stallTimeout = 30 * time.Second
 	startedAt := time.Now()
 	lastSegMTime := time.Time{}
+	firstSegLogged := false
+
+	// Skip motion scores during the first motionWarmup period after spawn:
+	// the decoder + tblend pipeline can produce a transient first sample
+	// (e.g. the first decoded frame's content compared to nothing) that
+	// would falsely trigger a clip we'd then have to salvage.
+	const motionWarmup = 2 * time.Second
 
 	// Per-period stats for the motion heartbeat.
 	var (
@@ -174,13 +181,16 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 				}
 				return err
 			}
+			if score.Wall.Sub(startedAt) < motionWarmup {
+				continue
+			}
 			periodFrames++
 			if score.YAVG > periodMaxScore {
 				periodMaxScore = score.YAVG
 			}
 			if score.YAVG >= s.Cfg.MotionThreshold {
 				periodTriggers++
-				s.handleMotion(score.Wall)
+				s.handleMotion(score.Wall, score.YAVG)
 			}
 
 		case now := <-tick.C:
@@ -204,9 +214,14 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 				// see one, kill ffmpeg so the supervisor retries.
 				if now.Sub(startedAt) > stallTimeout {
 					s.Logger.Printf("stall: no segments produced in %s, killing ffmpeg", stallTimeout)
-					_ = cmd.Process.Kill()
+					s.terminate(cmd)
 				}
 				continue
+			}
+			if !firstSegLogged {
+				s.Logger.Printf("first segment produced %s after spawn",
+					segs[0].MTime.Sub(startedAt).Truncate(time.Millisecond))
+				firstSegLogged = true
 			}
 			latest := segs[len(segs)-1].MTime
 			if !latest.Equal(lastSegMTime) {
@@ -214,20 +229,21 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 				continue
 			}
 			if now.Sub(latest) > stallTimeout {
-				s.Logger.Printf("stall: no new segment for %s (last at %s), killing ffmpeg",
+				s.Logger.Printf("stall: no new segment for %s (last at %s), terminating ffmpeg",
 					now.Sub(latest).Truncate(time.Second), latest.Format(time.RFC3339))
-				_ = cmd.Process.Kill()
+				s.terminate(cmd)
 			}
 		}
 	}
 }
 
-func (s *Supervisor) handleMotion(at time.Time) {
+func (s *Supervisor) handleMotion(at time.Time, score float64) {
 	prev := s.cur
 	s.cur = onMotion(s.cur, at, s.Cfg.PreRoll, s.Cfg.PostRoll, s.Cfg.MaxClipDuration)
 	s.lastMotion = at
 	if prev == nil {
-		s.Logger.Printf("motion: opening clip (start=%s, end=%s, hardCap=%s)",
+		s.Logger.Printf("motion: opening clip yavg=%.2f (start=%s, end=%s, hardCap=%s)",
+			score,
 			s.cur.startedAt.Format(time.RFC3339), s.cur.endsAt.Format(time.RFC3339), s.cur.hardCap.Format(time.RFC3339))
 	}
 }
@@ -239,7 +255,7 @@ func (s *Supervisor) handleTick(now time.Time) {
 	}
 	clip := s.cur
 	s.cur = nil
-	s.spawnFinalize(clip)
+	s.spawnFinalize(clip, false)
 
 	if sustained {
 		// Open a fresh clip immediately with a new pre-roll window — the
@@ -249,7 +265,7 @@ func (s *Supervisor) handleTick(now time.Time) {
 	}
 }
 
-func (s *Supervisor) spawnFinalize(clip *clipState) {
+func (s *Supervisor) spawnFinalize(clip *clipState, salvage bool) {
 	s.finalizeWG.Add(1)
 	go func() {
 		defer s.finalizeWG.Done()
@@ -262,7 +278,9 @@ func (s *Supervisor) spawnFinalize(clip *clipState) {
 			s.Logger.Printf("finalize: list segments: %v", err)
 			return
 		}
-		picked := SegmentsCovering(segs, clip.startedAt, clip.endsAt)
+		// Salvage finalize: don't grab the segment past endsAt — ffmpeg
+		// died before flushing it, so its tail is corrupt.
+		picked := SegmentsCovering(segs, clip.startedAt, clip.endsAt, !salvage)
 		if len(picked) == 0 {
 			s.Logger.Printf("finalize: no segments cover %s..%s; dropping clip",
 				clip.startedAt.Format(time.RFC3339), clip.endsAt.Format(time.RFC3339))
@@ -313,4 +331,15 @@ func (s *Supervisor) wipeSegmentDir() {
 	for _, e := range entries {
 		_ = os.Remove(filepath.Join(s.segDir, e.Name()))
 	}
+}
+
+// terminate sends SIGINT to ffmpeg so the segment muxer flushes the in-
+// progress segment cleanly, then escalates to SIGKILL after a short grace
+// period if the process hasn't exited yet. Used by the stall watchdog.
+func (s *Supervisor) terminate(cmd *exec.Cmd) {
+	_ = cmd.Process.Signal(os.Interrupt)
+	go func(c *exec.Cmd) {
+		time.Sleep(3 * time.Second)
+		_ = c.Process.Kill()
+	}(cmd)
 }
