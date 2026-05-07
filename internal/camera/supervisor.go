@@ -46,17 +46,22 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err := os.MkdirAll(s.outDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", s.outDir, err)
 	}
-	// Wipe any leftover segments from a previous run; their pts are stale
-	// and they'd just confuse SegmentsCovering.
-	s.wipeSegmentDir()
 
 	backoff := time.Second
 	for ctx.Err() == nil {
+		started := time.Now()
 		err := s.runOnce(ctx)
 		if ctx.Err() != nil {
 			break
 		}
-		s.Logger.Printf("ffmpeg exited: %v; restarting in %s", err, backoff)
+		// If ffmpeg ran successfully for a while before dying, treat this
+		// as a transient blip and reset the backoff. Otherwise a camera
+		// that flaps once an hour would sit at the 30s ceiling forever.
+		if time.Since(started) > 30*time.Second {
+			backoff = time.Second
+		}
+		s.Logger.Printf("ffmpeg exited after %s: %v; restarting in %s",
+			time.Since(started).Truncate(time.Millisecond), err, backoff)
 		select {
 		case <-ctx.Done():
 		case <-time.After(backoff):
@@ -69,15 +74,37 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 	}
 
-	s.Logger.Printf("shutdown: flushing in-flight clip if any")
-	s.flushOnShutdown()
-	s.finalizeWG.Wait()
+	// runOnce's defer already finalized the in-flight clip and waited for
+	// finalize goroutines on its way out. Nothing left to do.
+	s.Logger.Printf("supervisor stopped")
 	return nil
 }
 
 // runOnce launches one ffmpeg invocation and runs the state machine until
 // the process exits or ctx is cancelled. Returns the reason for exit.
+//
+// On exit, any in-progress clip is finalized truncated at the disconnect
+// moment so we don't lose pre-disconnect footage. The segment dir is
+// wiped before starting and after finalizing — leftover .ts files from
+// a previous ffmpeg invocation have stale mtimes that would confuse
+// SegmentsCovering on the next motion event after a reconnect.
 func (s *Supervisor) runOnce(ctx context.Context) error {
+	s.wipeSegmentDir()
+	defer func() {
+		// Save whatever we had recorded before ffmpeg died.
+		if s.cur != nil {
+			if now := time.Now(); now.Before(s.cur.endsAt) {
+				s.cur.endsAt = now
+			}
+			s.spawnFinalize(s.cur)
+			s.cur = nil
+		}
+		// Wait for any in-flight finalize to drain its segments before we
+		// nuke the directory; otherwise concat would reference deleted files.
+		s.finalizeWG.Wait()
+		s.wipeSegmentDir()
+	}()
+
 	args := FFmpegArgs(FFmpegArgsParams{
 		RTSPURL:        s.Cam.RTSP,
 		SegmentDir:     s.segDir,
@@ -230,19 +257,4 @@ func (s *Supervisor) wipeSegmentDir() {
 	for _, e := range entries {
 		_ = os.Remove(filepath.Join(s.segDir, e.Name()))
 	}
-}
-
-// flushOnShutdown finalizes whatever clip is in progress, using the time
-// of shutdown as endsAt. We don't wait for the natural post-roll: better
-// to save what we have than lose the clip entirely.
-func (s *Supervisor) flushOnShutdown() {
-	if s.cur == nil {
-		return
-	}
-	clip := s.cur
-	s.cur = nil
-	if now := time.Now(); now.Before(clip.endsAt) {
-		clip.endsAt = now
-	}
-	s.spawnFinalize(clip)
 }
