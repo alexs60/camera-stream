@@ -24,6 +24,12 @@ MAX_CLIP_SECONDS = 40
 # in slow motion). Two containers on a modest CPU should each run 10-15 fps.
 TARGET_FPS = float(os.getenv("TARGET_FPS", "15"))
 FRAME_INTERVAL = 1.0 / TARGET_FPS
+# If the grabber's frame timestamp doesn't advance for this long the stream
+# is considered stalled (TCP alive but no frames arriving) and we reconnect.
+STALL_TIMEOUT = 10.0
+# Periodic heartbeat so `docker logs` shows the loop is alive even when no
+# motion is firing.
+STATUS_INTERVAL = 30.0
 
 
 class FrameGrabber:
@@ -164,19 +170,31 @@ def main():
     clip_opened_at = 0.0
     recording_until = 0.0
     last_tick = 0.0
+    last_grabber_ts = 0.0
+    last_grabber_ts_change_at = time.time()
+    last_status_at = time.time()
+    frames_since_status = 0
+    motion_pixels_max = 0
+
+    def reconnect(reason):
+        nonlocal cap, grabber, out, last_tick, last_grabber_ts, last_grabber_ts_change_at
+        print(f"Reconnecting: {reason}")
+        if out is not None:
+            close_writer(out)
+            out = None
+            print("Recording saved (reconnect).")
+        grabber.stop()
+        cap.release()
+        cap = get_cap()
+        grabber = FrameGrabber(cap)
+        buffer.clear()
+        last_tick = 0.0
+        last_grabber_ts = 0.0
+        last_grabber_ts_change_at = time.time()
 
     while True:
         if not grabber.alive():
-            if out is not None:
-                close_writer(out)
-                out = None
-                print("Recording saved (stream dropped).")
-            grabber.stop()
-            cap.release()
-            cap = get_cap()
-            grabber = FrameGrabber(cap)
-            buffer.clear()
-            last_tick = 0.0
+            reconnect("grabber thread exited")
             continue
 
         # Pace the loop at TARGET_FPS. If processing took longer than the
@@ -189,16 +207,39 @@ def main():
         last_tick = time.time()
         now = last_tick
 
-        frame, _ = grabber.read()
+        frame, ts = grabber.read()
+
+        if ts != last_grabber_ts:
+            last_grabber_ts = ts
+            last_grabber_ts_change_at = now
+        elif now - last_grabber_ts_change_at > STALL_TIMEOUT:
+            reconnect(f"no fresh frames for {STALL_TIMEOUT:.0f}s")
+            continue
+
         if frame is None:
             continue
+
+        if now - last_status_at >= STATUS_INTERVAL:
+            elapsed = now - last_status_at
+            rate = frames_since_status / elapsed if elapsed > 0 else 0.0
+            print(
+                f"[heartbeat] {rate:.1f} fps, recording={out is not None}, "
+                f"buffer={len(buffer)}, last_motion_max_pixels={motion_pixels_max}"
+            )
+            last_status_at = now
+            frames_since_status = 0
+            motion_pixels_max = 0
+        frames_since_status += 1
 
         cutoff = now - PRE_ROLL_SECONDS
         while buffer and buffer[0][0] < cutoff:
             buffer.popleft()
 
         mask = back_sub.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        motion = cv2.countNonZero(mask) > MOTION_THRESHOLD
+        motion_pixels = cv2.countNonZero(mask)
+        if motion_pixels > motion_pixels_max:
+            motion_pixels_max = motion_pixels
+        motion = motion_pixels > MOTION_THRESHOLD
 
         if motion and out is None:
             print("Motion detected!")

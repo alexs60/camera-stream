@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+# Don't buffer stdout/stderr — without this, `docker logs` shows nothing
+# until the buffer fills or the process crashes.
+ENV PYTHONUNBUFFERED=1
+
 # Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y \
     libgl1 \
