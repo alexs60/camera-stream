@@ -1,4 +1,5 @@
 import cv2
+import errno
 import time
 import os
 import datetime
@@ -119,11 +120,25 @@ def write_frame(proc, frame):
         pass
 
 
+def safe_makedirs(path, retries=3, delay=0.5):
+    # NFS handles go stale (ESTALE = errno 116) if the export is remounted
+    # while we hold a cached handle. The next operation usually refreshes
+    # the client cache, so retry briefly instead of crashing.
+    for attempt in range(retries):
+        try:
+            os.makedirs(path, exist_ok=True)
+            return
+        except OSError as e:
+            if e.errno != errno.ESTALE or attempt == retries - 1:
+                raise
+            time.sleep(delay)
+
+
 def open_clip(buffer, w, h):
     day = datetime.datetime.now().strftime("%Y-%m-%d")
     ts = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     day_dir = f"{RECORDING_PATH}/{day}"
-    os.makedirs(day_dir, exist_ok=True)
+    safe_makedirs(day_dir)
     filename = f"{day_dir}/{ts}-{CAMERA_IP}.mp4"
     print(f"Recording to {filename}")
     out = open_writer(filename, w, h)
