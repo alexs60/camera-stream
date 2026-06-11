@@ -1,17 +1,30 @@
 services:
+  scrypted:
+    image: koush/scrypted
+    container_name: scrypted
+    restart: always
+    network_mode: "host"
+    volumes:
+      - ./scrypted-data:/server/volume
+    # Scrypted is heavy; it needs a moment to start the plugins
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   cam-recorder:
     build: .
     container_name: cam_recorder
     restart: always
     network_mode: "host"
+    depends_on:
+      scrypted:
+        condition: service_started
     env_file:
       - .env
-    # tmpfs for the rolling segment ring buffer: cheap, no disk wear.
-    # Size scales with camera count and segment retention; 256m is plenty
-    # for a handful of cameras at typical bitrates.
     tmpfs:
       - /tmp/cam-segments:size=256m
     volumes:
       - /mnt/data/camera-stream:/recordings
-    # Give the supervisor time to flush its in-flight clip on `docker stop`.
     stop_grace_period: 60s
