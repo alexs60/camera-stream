@@ -1,6 +1,6 @@
 services:
   blinkbridge:
-    image: rogerdammit/blinkbridge
+    build: https://github.com/roger-/blinkbridge.git
     container_name: blinkbridge
     restart: always
     network_mode: "host"
