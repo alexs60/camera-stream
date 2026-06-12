@@ -1,41 +1,26 @@
 services:
-  blink-bridge:
-    build: https://github.com/roger-/blinkbridge.git
-    container_name: blink_bridge
+  blinkbridge:
+    image: rogerdammit/blinkbridge
+    container_name: blinkbridge
     restart: always
     network_mode: "host"
-    environment:
-      - BLINK_USERNAME=${BLINK_USERNAME}
-      - BLINK_PASSWORD=${BLINK_PASSWORD}
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        cat <<EOF > config.json
-        {
-          "still_video_duration": 0.5,
-          "cameras": {
-            "enabled": [],
-            "disabled": [],
-            "max_failures": 3,
-            "restart_delay_seconds": 60
-          },
-          "blink": {
-            "login": {
-              "username": "$${BLINK_USERNAME}",
-              "password": "$${BLINK_PASSWORD}"
-            },
-            "history_days": 1,
-            "poll_interval": 60
-          },
-          "rtsp_server": {
-            "port": 8554
-          }
-        }
-        EOF
-        python3 -m blinkbridge.main
     volumes:
-      - ./blink-session:/root/.blinkpy
+      - ./blinkbridge-config:/config
+      - type: tmpfs
+        target: /working
+        tmpfs:
+          size: 52428800  # 50MB
+    tty: true
+    environment:
+      - BLINKBRIDGE_CONFIG=/config/config.json
+    depends_on:
+      - mediamtx
+
+  mediamtx:
+    image: bluenviron/mediamtx
+    container_name: mediamtx
+    restart: always
+    network_mode: "host"
 
   cam-recorder:
     build: .
@@ -43,7 +28,8 @@ services:
     restart: always
     network_mode: "host"
     depends_on:
-      - blink-bridge
+      - blinkbridge
+      - mediamtx
     env_file:
       - .env
     tmpfs:
