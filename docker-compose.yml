@@ -11,7 +11,28 @@ services:
       - /bin/sh
       - -c
       - |
-        echo "{\"username\": \"$${BLINK_USERNAME}\", \"password\": \"$${BLINK_PASSWORD}\", \"rtsp_port\": 8554}" > config.json
+        cat <<EOF > config.json
+        {
+          "still_video_duration": 0.5,
+          "cameras": {
+            "enabled": [],
+            "disabled": [],
+            "max_failures": 3,
+            "restart_delay_seconds": 60
+          },
+          "blink": {
+            "login": {
+              "username": "$${BLINK_USERNAME}",
+              "password": "$${BLINK_PASSWORD}"
+            },
+            "history_days": 1,
+            "poll_interval": 60
+          },
+          "rtsp_server": {
+            "port": 8554
+          }
+        }
+        EOF
         python3 -m blinkbridge.main
     volumes:
       - ./blink-session:/root/.blinkpy
