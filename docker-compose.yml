@@ -7,6 +7,12 @@ services:
     environment:
       - BLINK_USERNAME=${BLINK_USERNAME}
       - BLINK_PASSWORD=${BLINK_PASSWORD}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "{\"username\": \"$${BLINK_USERNAME}\", \"password\": \"$${BLINK_PASSWORD}\", \"rtsp_port\": 8554}" > config.json
+        python3 -m blinkbridge
     volumes:
       - ./blink-session:/root/.blinkpy
 
